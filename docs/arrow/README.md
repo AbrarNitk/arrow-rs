@@ -1,12 +1,30 @@
 # Apache Arrow Deep Dive In `arrow-rs`
 
-This directory is a guided, code-first tutorial for understanding Apache Arrow in the `arrow-rs` repository. It is written in the order you should read the implementation if your goal is to understand:
+This directory is a ground-up, implementation-linked tutorial for understanding Apache Arrow in the `arrow-rs` repository at a level where you should be able to:
 
-1. why Arrow is designed around columnar, zero-copy memory,
-2. how `arrow-rs` splits responsibilities across crates,
-3. how buffers, bitmaps, offsets, and child arrays physically represent data,
-4. how logical schema and physical layout are connected,
-5. how record batches, IPC, FFI, row format, and Parquet integration sit on top.
+1. explain the Arrow memory format from machine constraints upward,
+2. justify why the layout uses buffers, bitmaps, offsets, and child arrays,
+3. answer low-level questions about nullability, slicing, alignment, IPC, FFI, and row conversion,
+4. follow the `arrow-rs` code with confidence,
+5. sketch or build another Arrow implementation from scratch.
+
+The earlier version of these notes explained the crate structure correctly, but still leaned too much toward module summary. This version is meant to read like a systems tutorial: every major abstraction is presented as the answer to a specific storage, safety, or execution problem.
+
+## The questions this tutorial is trying to answer
+
+If you cannot answer these questions, you do not yet understand Arrow deeply enough:
+
+- Why does Arrow store data in buffers instead of per-value objects?
+- Why is nullability carried by a bitmap instead of by tagged values?
+- Why are offsets the right answer for variable-width data?
+- Why is `ArrayData` the critical invariant boundary?
+- Why are schema and physical layout separated into different crates?
+- Why is `Array` an `unsafe trait`?
+- Why does IPC preserve the in-memory layout instead of inventing a separate body format?
+- Why does Arrow need a row-oriented derivative format at all if it is columnar?
+- Why does the Rust implementation deliberately avoid a built-in `ChunkedArray` abstraction?
+
+The reading order is designed to answer those in dependency order.
 
 ## Recommended reading order
 
@@ -21,18 +39,52 @@ This directory is a guided, code-first tutorial for understanding Apache Arrow i
 9. [09-row-format-simd-and-execution-patterns.md](./09-row-format-simd-and-execution-patterns.md)
 10. [10-arrow-and-parquet-integration.md](./10-arrow-and-parquet-integration.md)
 11. [11-utilities-and-application-patterns.md](./11-utilities-and-application-patterns.md)
+12. [12-worked-example-from-arrays-to-ipc.md](./12-worked-example-from-arrays-to-ipc.md)
 
-## How to use these notes
+## How to read these notes
 
-Each chapter has a `Source markers` section. Those markers point at the main implementation entry points in this repository. Read the prose first, then open the linked code and follow the control flow outward only when you need more detail.
+Each chapter has a `Source markers` section. Use them in this order:
 
-The sequence is intentional:
+1. read the conceptual explanation first,
+2. check the diagram until you can restate it in your own words,
+3. only then open the linked code and map the concepts onto concrete types and functions.
 
-- start from machine-level memory and alignment assumptions,
-- then understand the low-level buffer contracts,
-- then study `ArrayData`, which is the physical invariant boundary,
-- then study schema and high-level typed arrays,
-- then move upward into `RecordBatch`, FFI, IPC, row encoding, and Parquet.
+If you open the code too early, Arrow can look like “a lot of array wrappers and builders.” In reality it is a tight answer to a small set of hard problems:
+
+- represent heterogeneous tabular data compactly,
+- make scans cache-friendly,
+- make slicing zero-copy,
+- preserve logical nullability without destroying physical density,
+- allow safe high-level APIs on top of low-level raw buffers,
+- serialize and share that memory across libraries and languages.
+
+## Mental model of the whole system
+
+At the highest level, Arrow is a contract between:
+
+- a producer that arranges data into a valid columnar memory layout,
+- and a consumer that can interpret those bytes as typed arrays without row-by-row decoding.
+
+```text
+application values
+   │
+   ├─ choose logical schema
+   ├─ arrange bytes into Arrow buffers
+   ├─ attach null bitmaps / offsets / child arrays
+   ├─ validate or trust the layout
+   └─ expose typed arrays / batches
+        │
+        ▼
+      Arrow memory
+        │
+        ├─ zero-copy slicing
+        ├─ compute kernels
+        ├─ IPC serialization
+        ├─ FFI export
+        └─ Parquet bridge
+```
+
+That is the whole system in one picture.
 
 ## Core source map
 

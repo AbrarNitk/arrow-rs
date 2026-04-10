@@ -1,81 +1,129 @@
 # 4. Schema, Fields, And Logical Types
 
-After physical layout comes the logical layer. Arrow separates:
+This chapter answers the logical question:
 
-- logical meaning: `DataType`, `Field`, `Schema`
-- physical realization: buffers, offsets, nulls, children
+**Once bytes are arranged correctly in memory, what meaning do those bytes have?**
 
-This separation is deliberate. The same logical type may be represented in different ways during transport or conversion, but the schema layer is the common contract applications reason about.
+Arrow answers that with `DataType`, `Field`, and `Schema`.
 
-## `DataType`: the logical universe
+## Why schema is separated from physical layout
 
-`arrow-schema/src/datatype.rs` defines the `DataType` enum. It includes:
+One of the most important architectural choices in Arrow is the separation between:
 
-- primitive fixed-width types,
-- temporal types,
-- decimal types,
-- binary and string types,
-- nested types like `List`, `Struct`, `Map`, `Union`,
-- specialized types like dictionaries and run-end encoding,
-- newer view-based variable-width types.
+- logical meaning,
+- physical realization.
 
-This enum is not just a catalog. Its documentation captures policy decisions and semantic constraints.
+That split makes several things possible:
 
-## Time semantics are treated carefully
+- schema negotiation without data ownership,
+- IPC/FFI schema exchange independent of buffers,
+- planning and type reasoning before any bytes are loaded,
+- multiple physical representations for related logical concepts.
 
-The timestamp docs are especially important. They explain that:
+If schema and buffer layout were fused into one giant type, all of those become harder.
 
-- timestamps with a timezone represent physical instants relative to the Unix epoch,
-- timestamps without a timezone are wall-clock values in an unknown timezone,
-- changing between non-empty timezones is metadata-only,
-- changing from no timezone to a timezone is not metadata-only.
+## `DataType` is the logical universe
 
-That is a design choice to preserve semantic precision. The type system encodes "what kind of time meaning do you have?" instead of forcing all timestamps into one interpretation.
+The `DataType` enum describes the meaning of values:
 
-## Why `Date64` is documented so cautiously
+- primitive scalars,
+- temporal values,
+- decimals,
+- strings and binaries,
+- nested structures,
+- dictionaries,
+- unions,
+- run-end encoded arrays,
+- view-based variable-width types.
 
-The `Date64` docs explain that the format historically stores date-like values as milliseconds since epoch, but valid values should still represent exact days. The crate does not strictly enforce divisibility by `86_400_000` for performance and usability reasons, and recommends `Date32` or proper timestamp types when those fit better.
+The important point is that `DataType` is not just an enum for display. Its docs capture semantic policies and edge-case meaning that later layers rely on.
 
-This is a good example of Arrow Rust's style:
+## Why timestamp semantics are documented so carefully
 
-- preserve compatibility with the spec and ecosystem,
-- document edge semantics clearly,
-- avoid costly validation in hot paths when the benefit is limited.
+The timestamp documentation is one of the best places to see Arrow's philosophy.
 
-## `Field`: more than name + type
+It distinguishes:
 
-A `Field` contains:
+- timestamps with a timezone: physical instants relative to the Unix epoch,
+- timestamps without a timezone: wall-clock values in an unspecified zone.
+
+That is a policy choice in favor of semantic precision. The type system is trying to prevent the common but incorrect collapse of:
+
+```text
+"time with explicit timezone meaning"
+and
+"time value with no timezone meaning"
+```
+
+into one ambiguous representation.
+
+This is why metadata-only timezone conversion is allowed in one case and not the other.
+
+## Why `Date64` is handled pragmatically
+
+The docs explain that `Date64` historically stores date-like values in milliseconds since epoch, and exact-day semantics are desirable, but the crate does not strictly validate divisibility by `86_400_000`.
+
+That reveals another important policy:
+
+- document semantic expectations clearly,
+- preserve compatibility,
+- avoid expensive or surprising validation in hot paths when the value is limited.
+
+This is a recurring Arrow Rust theme: correctness through invariant boundaries and documentation, not gratuitous runtime cost everywhere.
+
+## Why `Field` is more than name + type
+
+A `Field` carries:
 
 - name,
 - `DataType`,
 - nullability,
 - metadata.
 
-For nested types, children are embedded inside the `DataType` and `Field` structure. A `List<Field>` or `Struct<Fields>` expresses the logical tree that the physical layout must later realize.
+This is the smallest unit of logical contract that still matters operationally.
 
-One subtle implementation detail matters: schema equality intentionally ignores deprecated IPC-specific dictionary id state. That choice keeps logical schema equality focused on application-visible meaning rather than transport-era baggage.
+Why nullability is here:
 
-## `Schema`: dataset-level contract
+- logical nullability is part of meaning, not just a physical storage detail.
 
-A `Schema` is a collection of `Field`s plus metadata. It tells you:
+Why metadata is here:
 
-- how many columns exist,
+- systems often need semantic hints without inventing new physical types.
+
+For nested data, fields recursively define the logical tree that physical arrays will realize.
+
+## Why schema equality is opinionated
+
+One subtle implementation detail is especially revealing: logical field/schema equality intentionally ignores deprecated IPC-era dictionary id baggage.
+
+That tells you the maintainers are protecting a distinction between:
+
+- logical equality users care about,
+- transport-specific bookkeeping users should not have to treat as schema meaning.
+
+This is a good example of an implementation refusing to let historical serialization details leak into the logical model.
+
+## Why `Schema` does not know row count or buffers
+
+A `Schema` tells you:
+
+- what columns exist,
 - what each column means,
-- whether fields are nullable,
-- what extra user or system metadata is attached.
+- how nested children are structured,
+- what metadata is attached.
 
 It does **not** tell you:
 
-- the number of rows,
-- how buffers are allocated,
-- whether the data is contiguous in one region,
-- what IPC framing exists.
+- how many rows there are,
+- where buffers live,
+- whether there is IPC framing,
+- whether the data came from FFI, Parquet, or in-memory builders.
 
-That separation is important. A schema is reusable across many batches.
+That is intentional. A schema is a reusable logical contract across many batches and transport boundaries.
 
-## Logical tree versus physical leaves
+## Logical tree versus physical nodes
 
-For nested data, logical schema is tree-shaped while physical buffers are organized around concrete array nodes.
+Example:
 
 ```text
 Schema
@@ -85,34 +133,44 @@ Schema
     >>
 
 Physical realization
-  List array
+  List node
     offsets buffer
-    child Struct array
-      child Int64 array
-        values buffer
-        null bitmap?
-      child Utf8 array
-        offsets buffer
-        values buffer
-        null bitmap?
+    child Struct node
+      child Int64 node
+      child Utf8 node
 ```
 
-The schema tells you what nodes exist; `ArrayData` and typed arrays tell you how those nodes are stored.
+The schema gives meaning to the tree. `ArrayData` and typed arrays tell you how each node is physically realized.
 
-## Why the schema layer is isolated in its own crate
+## Why the schema layer has its own crate
 
-This separation makes several things easier:
+Because many important tasks are “schema-only” tasks:
 
-- systems can negotiate schemas without owning data buffers,
-- IPC and FFI can import/export schema independently of array bodies,
-- logical planning can run without pulling in compute or buffer code,
-- metadata transformations stay decoupled from allocation concerns.
+- planning,
+- negotiation,
+- metadata transformation,
+- FFI schema exchange,
+- IPC schema exchange,
+- logical equality checks.
+
+Putting schema in its own crate keeps those tasks decoupled from allocation and compute.
+
+## Reimplementation checklist
+
+To build another Arrow implementation, you need:
+
+1. a logical type universe,
+2. fields carrying nullability and metadata,
+3. schemas as reusable dataset-level contracts,
+4. a clean separation from physical buffers.
+
+That is the meaning layer of the system.
 
 ## Source markers
 
-- `DataType` and datatype docs:
+- `DataType`:
   [`arrow-schema/src/datatype.rs`](../../arrow-schema/src/datatype.rs#L96)
-- `Field` definition:
+- `Field`:
   [`arrow-schema/src/field.rs`](../../arrow-schema/src/field.rs#L49)
 - `SchemaBuilder` and `Schema`:
   [`arrow-schema/src/schema.rs`](../../arrow-schema/src/schema.rs#L29),

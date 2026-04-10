@@ -1,12 +1,37 @@
 # 3. `ArrayData`: The Physical Invariant Boundary
 
-Once you understand buffers, the next key type is `ArrayData`. This is where Arrow stops being "some bytes in memory" and becomes "a valid Arrow array layout."
+This chapter answers the next major question:
 
-`arrow-data` exists because the project needs one generic, type-independent representation that can describe every array shape.
+**When do a bunch of buffers stop being “some bytes” and become “a valid Arrow array”?**
 
-## What `ArrayData` contains
+`ArrayData` is the boundary where that transition happens.
 
-At a high level, `ArrayData` contains:
+## Why `ArrayData` exists
+
+If Arrow only exposed typed arrays such as `Int32Array` or `StringArray`, many important tasks would become awkward:
+
+- generic validation,
+- IPC import/export,
+- FFI import/export,
+- dynamic readers,
+- nested layout reasoning before downcasting,
+- building arrays from raw buffers.
+
+So the project needs one universal physical representation that can describe:
+
+- fixed-width arrays,
+- variable-width arrays,
+- nested arrays,
+- dictionary arrays,
+- unions,
+- view arrays,
+- nullability and slicing state.
+
+That representation is `ArrayData`.
+
+## What `ArrayData` stores
+
+At a high level:
 
 - `data_type`
 - `len`
@@ -15,9 +40,28 @@ At a high level, `ArrayData` contains:
 - `child_data`
 - `nulls`
 
-That is enough to represent primitive arrays, strings, lists, structs, unions, dictionary arrays, and view arrays.
+That sounds simple, but it is carrying almost the entire physical contract of Arrow.
 
-## The core picture
+## The key design split
+
+`ArrayData` says:
+
+- what physical buffers exist,
+- how many logical elements are visible,
+- where slicing starts,
+- which child arrays belong to this node,
+- whether nullability exists.
+
+It does **not** decide:
+
+- what high-level methods the user sees,
+- how kernels downcast typed arrays,
+- how IPC frames messages,
+- how schema should be displayed.
+
+Those are higher layers.
+
+## Core picture: variable-width array
 
 ```text
 ArrayData
@@ -28,18 +72,16 @@ ArrayData
   buffers   = [offsets, values]
   children  = []
 
-        ┌───────────────────────────┐
-        │ offsets: [0, 5, 5, 9]     │
-        └───────────────────────────┘
-        ┌───────────────────────────┐
-        │ values: "hellorust"       │
-        └───────────────────────────┘
-        ┌───────────────────────────┐
-        │ nulls : 1 0 1             │
-        └───────────────────────────┘
+offsets = [0, 5, 5, 9]
+values  = "hellorust"
+nulls   = [1, 0, 1]
 ```
 
-For a nested type like `List<Int32>`, the parent `ArrayData` points to child `ArrayData`:
+This one object is enough for generic code to understand the physical shape of the array without knowing about `StringArray` methods.
+
+## Core picture: nested array
+
+For `List<Int32>`:
 
 ```text
 Parent ArrayData (List)
@@ -52,94 +94,137 @@ Child Int32 ArrayData
   values = [10, 11, 20, 21, 22]
 
 logical rows:
-  row0 -> child[0..2] = [10, 11]
-  row1 -> child[2..2] = []
-  row2 -> child[2..5] = [20, 21, 22]
+  row0 -> child[0..2]
+  row1 -> child[2..2]
+  row2 -> child[2..5]
 ```
 
-## Why `ArrayData` matters so much
+The important thing to notice is that the parent does not duplicate child values. Nested structure is represented by composition of array nodes, not by inventing a different buffer model.
 
-Typed arrays in `arrow-array` are mostly wrappers around `ArrayData` or structured equivalents of the same parts.
+## Why `new_buffers` is such an important map
 
-That means `ArrayData` is the place where the library must answer hard questions:
+The helper `new_buffers(data_type, capacity)` in `arrow-data/src/data.rs` is one of the fastest ways to understand Arrow's physical storage policy.
 
-- How many buffers does this `DataType` require?
-- Which buffer positions mean what?
-- Are offsets monotonic?
-- Are buffer lengths large enough?
-- Do child arrays agree with parent layout?
-- Are null counts and null buffers coherent?
+It tells you, per logical type:
 
-## `new_buffers` shows the canonical layout patterns
+- primitive types -> one values buffer,
+- booleans -> one bitmap buffer,
+- `Utf8` / `Binary` -> offsets + values,
+- `Utf8View` / `BinaryView` -> one fixed-width views buffer,
+- `List` -> offsets, child arrays,
+- `Struct` -> children only,
+- `DenseUnion` -> type ids + offsets + children.
 
-The helper `new_buffers(data_type, capacity)` in `arrow-data/src/data.rs` is a useful reading shortcut. It reveals the default physical buffer shape expected for each logical type:
+That is the real “physical type table” of the implementation.
 
-- primitive types => one values buffer,
-- booleans => one bit-packed buffer,
-- `Utf8` / `Binary` => offsets + values,
-- `Utf8View` / `BinaryView` => one `u128` views buffer,
-- `List` => offsets + child array,
-- `Struct` => children only,
-- `Union::Dense` => type ids + offsets + children.
+## Why `offset` is subtle
 
-That function is effectively a compact map from logical type to memory shape.
+The `offset` field is easy to misunderstand.
 
-## Offsets do not mean the same thing everywhere
+It applies to:
 
-One of the most important details in `ArrayData` is the `offset` field:
+- `buffers`
+- `child_data`
 
-- it applies to `buffers`,
-- it applies to `child_data`,
-- it does **not** apply to `nulls` in the same way.
+but not to `nulls` in the same way. The null buffer already represents the visible logical length.
 
-The code comments explicitly call this out. This matters because slicing an array should be cheap. A sliced array should often just adjust logical offset and length while still referencing the same underlying buffers.
+Why this matters:
 
-## Validation versus unchecked construction
+- slicing must be cheap,
+- slices should usually share underlying storage,
+- but shared storage cannot mean the null semantics become ambiguous.
 
-The API exposes both:
+This is a good example of where the representation is optimized for zero-copy slicing without making null handling unsafe.
 
-- `try_new(...)`
-- `unsafe new_unchecked(...)`
+## Why `try_new` and `new_unchecked` both exist
 
-This is the core trust boundary.
+The existence of both constructors tells you where the trust boundary is.
 
-Use `try_new` when data may be malformed. It validates the physical layout. Use `new_unchecked` only when the caller can already prove the invariants.
+### `try_new`
 
-That split is one of the deepest architectural decisions in Arrow Rust:
+Use when:
 
-- safety at the public boundary,
-- optional unchecked fast paths for internal or trusted code,
-- centralized validation instead of scattered ad hoc checks.
+- buffers come from untrusted or external sources,
+- a malformed layout is possible,
+- you want Arrow to validate the physical structure.
 
-## `layout(data_type)` is the machine-readable storage policy
+### `unsafe new_unchecked`
 
-The function `layout(data_type)` returns a `DataTypeLayout`, including `BufferSpec`s describing the expected buffers.
+Use when:
 
-This is where Arrow's physical rules are turned into code that other layers can consume. If you want to know "what buffers should this type have?", this function is one of the best anchors in the codebase.
+- the caller already knows the invariants hold,
+- validation cost would be redundant,
+- the data is internal or otherwise trusted.
 
-## Why `ArrayData` is kept generic instead of using only typed arrays
+This is one of the deepest architectural choices in Arrow Rust:
 
-Three reasons:
+- high-level safety by default,
+- explicit unsafe fast paths for trusted construction,
+- centralized validation instead of ad hoc checks everywhere.
 
-1. IPC, FFI, and generic readers need one universal representation.
-2. Validation logic should not be duplicated across every typed array.
-3. Nested and dynamically typed processing often needs to reason about layout before it knows the exact concrete Rust array type.
+## Why validation is centralized
 
-So `ArrayData` is not just a fallback abstraction. It is the canonical physical contract.
+`validate_data()` checks questions like:
+
+- are there enough buffers?
+- are buffer lengths large enough for `len + offset`?
+- do offsets fit the child/value buffers?
+- do child arrays agree with the parent layout?
+- is null buffer length sufficient?
+
+This is not just defensive programming. It allows the rest of the system to rely on strong assumptions once an `ArrayData` exists.
+
+That is why `Array` being `unsafe` later on makes sense: many typed-array operations assume `ArrayData`-level invariants already hold.
+
+## Why `layout(data_type)` matters so much
+
+`layout(data_type)` returns a `DataTypeLayout` with `BufferSpec`s.
+
+This function is the machine-readable form of Arrow's physical policy:
+
+- which buffers exist,
+- fixed-width versus variable-width,
+- required alignment,
+- whether nulls are allowed,
+- whether buffer count is variadic.
+
+If you wanted to generate validators, importers, or generic builders automatically, this is one of the most important functions in the codebase.
+
+## Why `ArrayData` is the right abstraction boundary
+
+It sits at exactly the right layer:
+
+- low enough to describe all array layouts,
+- high enough to hide raw allocator details,
+- generic enough for IPC/FFI,
+- structured enough for validation.
+
+This is why many later abstractions reduce to `ArrayData` or are rebuilt from it.
+
+## Reimplementation checklist
+
+To build another Arrow implementation, you would need:
+
+1. a universal physical array descriptor,
+2. a table mapping logical types to buffer layouts,
+3. centralized validation,
+4. explicit slicing semantics,
+5. a trust boundary between checked and unchecked construction.
+
+That is the real job of `ArrayData`.
 
 ## Source markers
 
-- `ArrayData` definition and memory layout docs:
+- `ArrayData` definition:
   [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L205)
-- Canonical buffer creation per datatype:
-  [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L59)
-- Checked vs unchecked construction:
+- Checked and unchecked construction:
   [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L273),
   [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L315)
-- Validation entry point:
-  [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L1271)
-- Physical layout descriptor:
-  [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L1690),
+- Canonical buffer creation:
+  [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L59)
+- `layout(data_type)` and `DataTypeLayout`:
+  [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L1690)
+- `BufferSpec`:
   [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L1886)
-- Builder for assembling `ArrayData`:
+- Builder:
   [`arrow-data/src/data.rs`](../../arrow-data/src/data.rs#L1984)

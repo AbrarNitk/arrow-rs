@@ -1,95 +1,159 @@
 # 7. FFI And Zero-Copy Boundaries
 
-Arrow becomes much more useful when one process or library can hand memory to another without re-encoding every value. That is the job of the Arrow C Data Interface and the FFI support in `arrow-rs`.
+This chapter answers the interop question:
 
-## Two sides of the FFI boundary
+**How can Arrow data cross library or language boundaries without re-encoding values into a second representation first?**
 
-The implementation splits schema and data ownership cleanly:
+The answer is the Arrow C Data Interface and the FFI support in `arrow-rs`.
 
-- `arrow-schema/src/ffi.rs` exports/imports `FFI_ArrowSchema`
-- `arrow-data/src/ffi.rs` exports/imports `FFI_ArrowArray`
+## Why Arrow can support low-overhead FFI in the first place
 
-That mirrors Arrow's conceptual split:
+Arrow's layout already has the right properties:
 
-- schema tells consumers how to interpret the buffers,
-- array data points at the actual buffers and children.
+- buffers are explicit,
+- children are explicit,
+- nullability is explicit,
+- slicing is metadata-driven,
+- schema is separate from data.
 
-## Why Arrow FFI works well
-
-The C Data Interface does not require a process to serialize into IPC first. Instead, it passes:
+That means exporting an array is largely a matter of exporting:
 
 - pointers,
 - lengths,
-- child pointers,
-- release callbacks,
-- format strings and metadata.
+- child relationships,
+- release semantics.
 
-In other words, it exports the Arrow in-memory contract directly.
+In a row/object-heavy model, far more hidden state would have to be reconstructed or normalized first.
 
-## Ownership is carried by release callbacks
+## Why the FFI layer is split into schema-side and data-side structs
 
-The most important implementation detail is not the struct fields themselves. It is the release mechanism.
+`arrow-rs` uses:
 
-When Rust exports Arrow data to C:
+- `FFI_ArrowSchema` in `arrow-schema`
+- `FFI_ArrowArray` in `arrow-data`
 
-- Rust allocates or references the underlying storage,
-- the exported struct stores pointers to that storage,
-- a `release` callback knows how to free or drop the owned private data later.
+This mirrors a core Arrow separation:
 
-This is why the FFI structs carry `private_data`. Raw pointers alone are not enough; somebody must own the lifetime graph.
+- schema describes meaning,
+- array data describes memory.
+
+That split is not cosmetic. It allows:
+
+- schema exchange without body exchange,
+- body exchange under an already-known schema,
+- composition with systems that separately track meaning and storage.
+
+## Why raw pointers are not enough
+
+The most important implementation detail is the release callback plus `private_data`.
+
+If the FFI structs only stored raw pointers, they would answer:
+
+- where the data is,
+
+but not:
+
+- who owns it,
+- when it may be freed,
+- how children and dictionaries stay alive,
+- how exported metadata strings are reclaimed.
+
+So the real FFI contract is:
 
 ```text
-Rust Arrow values
+pointer graph + ownership protocol
+```
+
+not just:
+
+```text
+some C structs with fields
+```
+
+## Why release callbacks are the critical safety mechanism
+
+When Rust exports Arrow values:
+
+- Rust still owns the underlying buffers or knows who does,
+- the FFI structs point into that owned state,
+- a release callback knows how to reclaim the private state later.
+
+```text
+Rust values
    │
    ▼
 FFI_ArrowSchema / FFI_ArrowArray
-   pointers + children + dictionary + release fn + private_data
+  pointers
+  children
+  dictionary
+  release fn
+  private_data
    │
    ▼
-Foreign consumer
+foreign consumer
    │
    ▼
-calls release when done
+calls release exactly once when done
 ```
 
-## Why this design matches Arrow's buffer model
+That callback is what turns a dangerous raw-pointer export into a tractable ownership handoff.
 
-Arrow arrays are already:
+## Why `from_raw` is unsafe
 
-- contiguous,
-- sliceable,
-- reference-counted or externally owned,
-- explicit about child arrays and null buffers.
+Importing from raw FFI structs is unsafe because the caller is asserting:
 
-That means they map naturally onto FFI structs. There is much less hidden state than in object-heavy row models.
+- the pointers are valid,
+- the struct is initialized correctly,
+- ownership transfer rules are respected,
+- release semantics are coherent.
 
-## Zero-copy mmap example
+This is the natural mirror of `ArrayData::new_unchecked`: the system must have an explicit boundary where external bytes/pointers become trusted Arrow state.
 
-The example `arrow/examples/zero_copy_ipc.rs` is worth reading even before the IPC chapter. It shows the practical path:
+## Why FFI is lower-level than IPC
 
-1. memory-map an IPC file,
-2. wrap the mmap region in `bytes::Bytes`,
-3. wrap that in `arrow_buffer::Buffer`,
-4. let `FileDecoder` produce arrays that reference the mapped memory directly.
+Arrow IPC and FFI are related but different:
 
-This is Arrow's promise in concrete form: if the bytes already match Arrow layout rules, reading can become mostly a metadata and pointer-construction exercise.
+- FFI shares a live Arrow layout across a process or library boundary,
+- IPC serializes Arrow layout into a framed byte protocol for files/streams.
 
-## FFI is lower-level than IPC
+Both can be zero-copy friendly, but FFI is closer to the raw memory model while IPC adds transport framing, message boundaries, and versioning.
 
-It helps to distinguish them:
+## Why zero-copy mmap examples matter here too
 
-- FFI: share already-live Arrow memory across a process or language boundary.
-- IPC: serialize Arrow messages into a byte protocol for streams or files.
+The example `arrow/examples/zero_copy_ipc.rs` is conceptually adjacent to FFI because it shows the same underlying promise:
 
-Both are zero-copy friendly, but FFI is closer to the raw memory model while IPC adds framing and transport structure.
+- if bytes already satisfy Arrow layout rules,
+- higher layers can construct arrays mostly by wiring pointers and metadata,
+- not by rebuilding values cell by cell.
+
+That is the practical meaning of Arrow's interop story.
+
+## Reimplementation checklist
+
+To build Arrow interop seriously, you need:
+
+1. schema export/import,
+2. array export/import,
+3. ownership carried by release callbacks,
+4. explicit private state to keep pointer graphs alive,
+5. unsafe trust boundaries for raw imports.
+
+That is the FFI layer.
 
 ## Source markers
 
-- Schema-side C Data Interface:
-  [`arrow-schema/src/ffi.rs`](../../arrow-schema/src/ffi.rs#L22),
+- `FFI_ArrowSchema`:
   [`arrow-schema/src/ffi.rs`](../../arrow-schema/src/ffi.rs#L77)
-- Array-side C Data Interface:
-  [`arrow-data/src/ffi.rs`](../../arrow-data/src/ffi.rs#L27),
+- Schema release callback and private data:
+  [`arrow-schema/src/ffi.rs`](../../arrow-schema/src/ffi.rs#L97),
+  [`arrow-schema/src/ffi.rs`](../../arrow-schema/src/ffi.rs#L123)
+- `FFI_ArrowArray`:
   [`arrow-data/src/ffi.rs`](../../arrow-data/src/ffi.rs#L39)
-- Zero-copy IPC example with mmap:
+- Array release callback and private data:
+  [`arrow-data/src/ffi.rs`](../../arrow-data/src/ffi.rs#L70),
+  [`arrow-data/src/ffi.rs`](../../arrow-data/src/ffi.rs#L119)
+- `from_raw` boundaries:
+  [`arrow-schema/src/ffi.rs`](../../arrow-schema/src/ffi.rs#L244),
+  [`arrow-data/src/ffi.rs`](../../arrow-data/src/ffi.rs#L224)
+- Zero-copy IPC example:
   [`arrow/examples/zero_copy_ipc.rs`](../../arrow/examples/zero_copy_ipc.rs#L1)

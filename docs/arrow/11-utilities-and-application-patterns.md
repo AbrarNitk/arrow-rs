@@ -1,118 +1,124 @@
-# 11. Utilities, Common Workflows, And How To Apply Arrow
+# 11. Utilities, Workflows, And How To Apply Arrow
 
-The earlier chapters focused on invariants and storage. This chapter answers the practical question: how do you use these layers in real code without losing the underlying model?
+This chapter answers the practical question:
 
-## Workflow 1: Build arrays directly
+**Given all the lower-level theory, which Arrow layer should you actually reach for in a real system, and why?**
+
+The goal here is not just API recommendation. It is to connect use cases back to the design logic from earlier chapters.
+
+If you have not yet read the synthesis chapter, read [12-worked-example-from-arrays-to-ipc.md](./12-worked-example-from-arrays-to-ipc.md) before treating these workflows as “just choose the right crate.” The worked example makes the transitions between buffers, arrays, `RecordBatch`, and IPC concrete.
+
+## Workflow 1: Build typed arrays directly
 
 Use typed array constructors or builders when:
 
-- data is already in process memory,
-- you want exact control over nulls and offsets,
-- you are writing kernels or tests.
+- your data already lives in process memory,
+- you want direct control over nulls and offsets,
+- you are writing compute kernels, tests, or low-overhead ingestion code.
 
-Example shape:
+Why this makes sense:
 
-```rust
-use arrow_array::{Int32Array, StringArray, RecordBatch};
-use std::sync::Arc;
+- you stay close to the real memory model,
+- there is minimal abstraction overhead,
+- you can reason directly about buffers and nullability.
 
-let ids = Int32Array::from(vec![1, 2, 3]);
-let names = StringArray::from(vec![Some("alice"), None, Some("carol")]);
+## Workflow 2: Build `ArrayData` when crossing low-level boundaries
 
-let batch = RecordBatch::try_from_iter(vec![
-    ("id", Arc::new(ids) as _),
-    ("name", Arc::new(names) as _),
-])?;
-# Ok::<(), arrow_schema::ArrowError>(())
-```
-
-Use this path when you care most about memory layout and low overhead.
-
-## Workflow 2: Build `ArrayData` when implementing lower-level systems
-
-Use `ArrayData` or `ArrayDataBuilder` when:
+Use `ArrayData` / `ArrayDataBuilder` when:
 
 - importing foreign memory,
-- writing specialized readers,
-- constructing arrays from raw buffers,
-- validating layout boundaries explicitly.
+- writing a custom reader,
+- reconstructing arrays from raw buffers,
+- validating physical layouts explicitly,
+- implementing a transport or FFI bridge.
 
-This is the right layer for custom IPC/FFI bridges and low-level engine internals.
+Why this makes sense:
+
+- `ArrayData` is the invariant boundary,
+- it is lower level than typed arrays but still structured enough to validate,
+- it is the right place to turn “some bytes” into “trusted Arrow array.”
 
 ## Workflow 3: Use `RecordBatch` as the pipeline unit
 
 Use `RecordBatch` when:
 
-- moving tabular data between operators,
-- writing readers/writers,
-- feeding Parquet or IPC,
-- integrating with query engines.
+- passing tabular data between operators,
+- integrating with query engines,
+- writing IPC or Parquet,
+- building batch-oriented dataflows.
 
-This is the normal application-level Arrow unit.
+Why this makes sense:
 
-## Workflow 4: IPC for transport and caching
+- it preserves schema + aligned column sets,
+- it is neutral about execution strategy,
+- it is the common contract shared by many Arrow-adjacent systems.
+
+## Workflow 4: Use IPC for transport and cache artifacts
 
 Use `arrow-ipc` when:
 
 - sending Arrow data over the network,
-- writing fast reopenable caches,
-- preserving Arrow layout semantics across process boundaries,
-- enabling zero-copy reads from memory-mapped files.
+- caching Arrow-native artifacts on disk,
+- preserving buffer layout across process boundaries,
+- enabling zero-copy-friendly reopen paths such as mmap.
 
-The file variant is better for persisted artifacts. The stream variant is better for forward-only transport.
+Why this makes sense:
 
-## Workflow 5: FFI for language or library boundaries
+- IPC is closest to the in-memory model,
+- reconstruction can often be cheap,
+- you keep Arrow semantics without translating into a different data model.
+
+## Workflow 5: Use FFI for language or library boundaries
 
 Use the C Data Interface when:
 
-- another library already understands Arrow C ABI,
-- you want to avoid full serialization,
-- schema and buffers can stay live across the boundary.
+- another component already speaks Arrow C ABI,
+- you want to avoid a full serialization step,
+- buffers and schema can stay alive across the boundary.
 
-This is often the lowest-overhead interoperability path.
+Why this makes sense:
 
-## Workflow 6: Row conversion for sort/group heavy operators
+- FFI is lower-overhead than IPC when both sides can share live memory conventions,
+- Arrow's explicit buffer model maps naturally to this interface.
+
+## Workflow 6: Use `arrow-row` for comparison-heavy execution
 
 Use `arrow-row` when:
 
-- comparing composite keys repeatedly,
-- building sort keys,
-- implementing grouping or window pre-processing,
-- lexicographic row comparison is the hot path.
+- multi-column comparison dominates runtime,
+- you need normalized sort keys,
+- grouping or window partition comparison is hot,
+- lexicographic ordering over tuples matters more than pure scan throughput.
 
-Do not confuse this with replacing Arrow storage. It is a derivative execution format, not the primary storage format.
+Why this makes sense:
 
-## Workflow 7: Parquet for persistence
+- columnar is not optimal for every operator,
+- the row format is specifically designed to make tuple comparison cheap,
+- you are deriving an execution shape, not replacing Arrow storage.
+
+## Workflow 7: Use Parquet when persistence matters more than staying purely in-memory
 
 Use Parquet when:
 
-- data must be stored on disk efficiently,
-- compression and encoded pages matter,
-- row groups and statistics matter,
-- Arrow is the in-memory model but Parquet is the archival or exchange artifact.
+- data must be stored efficiently on disk,
+- compression and page-level encoding matter,
+- row-group and statistics-based pruning matter,
+- Arrow is your in-memory representation but not your archival format.
 
-Common pattern:
+Why this makes sense:
 
-```text
-source data
-  -> Arrow arrays / RecordBatch
-  -> compute / transform
-  -> Parquet for storage
+- Arrow is the in-memory contract,
+- Parquet is the persisted columnar file format,
+- the bridge between them is explicit rather than pretending they are the same thing.
 
-later:
-Parquet
-  -> Arrow RecordBatch
-  -> compute / filtering / analytics
-```
+## Example repository paths worth reading
 
-## Examples worth reading in this repository
-
-- zero-copy IPC reading:
+- zero-copy IPC example:
   [`arrow/examples/zero_copy_ipc.rs`](../../arrow/examples/zero_copy_ipc.rs)
-- Parquet Arrow reading/writing examples:
+- Parquet Arrow bridge examples:
   [`parquet/examples`](../../parquet/examples)
 
-## A practical reading path through the code
+## A productive code-reading path
 
 If your goal is to become productive in `arrow-rs`, read in this order:
 
@@ -124,15 +130,25 @@ If your goal is to become productive in `arrow-rs`, read in this order:
 6. `arrow-row`
 7. `parquet/src/arrow`
 
-That order follows dependency and concept flow. It is the shortest path from "why is this buffer shaped like this?" to "how does this become a Parquet file or IPC stream?"
+That is the dependency and concept flow of the repo. It is the shortest path from:
+
+```text
+"why is this buffer shaped like this?"
+```
+
+to:
+
+```text
+"how does this become a RecordBatch, an IPC file, or a Parquet file?"
+```
 
 ## Source markers
 
-- High-level facade and examples:
+- High-level facade:
   [`arrow/src/lib.rs`](../../arrow/src/lib.rs)
-- Typed array usage patterns:
+- Typed arrays:
   [`arrow-array/src/lib.rs`](../../arrow-array/src/lib.rs)
-- Batch API:
+- `RecordBatch`:
   [`arrow-array/src/record_batch.rs`](../../arrow-array/src/record_batch.rs)
 - IPC example:
   [`arrow/examples/zero_copy_ipc.rs`](../../arrow/examples/zero_copy_ipc.rs)

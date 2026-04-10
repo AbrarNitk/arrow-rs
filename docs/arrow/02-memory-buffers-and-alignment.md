@@ -1,110 +1,157 @@
 # 2. Memory, Buffers, Bitmaps, And Alignment
 
-Arrow performance starts before Arrow types appear. It starts with the assumption that scanning contiguous memory is cheaper than chasing pointers through row objects.
+This chapter answers a machine-level question:
 
-## Why columnar memory matters at CPU level
+**What memory properties must hold if higher layers are going to reinterpret raw bytes as typed arrays cheaply and safely?**
 
-When a kernel reads one column of `Int32`, it wants:
+Arrow's buffer layer is the answer.
 
-- one tight values buffer,
+## Start with the hardware problem
+
+CPUs are fast when work looks like:
+
+- sequential loads,
 - predictable stride,
-- minimal branches,
-- prefetch-friendly access,
-- no object headers between values.
+- low branch entropy,
+- minimal pointer chasing,
+- high cache reuse,
+- layouts the compiler can vectorize.
 
-That gives the CPU a chance to use caches, prefetchers, vectorized loads, and branch prediction well.
+They are much slower when work looks like:
 
-The Arrow layout is therefore built around a few primitive storage shapes:
+- follow a pointer to a row object,
+- follow another pointer to a string object,
+- inspect an enum tag for nullability,
+- branch on every value,
+- repeat for millions of rows.
+
+Arrow's buffer model exists to keep the hot path in the first category.
+
+## Why buffers instead of per-value objects
+
+The basic Arrow policy is:
+
+- store values contiguously,
+- move variability into side structures,
+- make nullability orthogonal,
+- make slicing metadata-only whenever possible.
+
+That is why the recurring storage shapes are so simple:
 
 ```text
-Fixed-width values:
+fixed-width values:
   [v0][v1][v2][v3]...
 
-Validity bitmap:
+validity bitmap:
   bit0 bit1 bit2 bit3 ...
 
-Offsets + values:
+offsets + values:
   offsets: [0][5][5][9]...
-  values : [h e l l o a b c d ...]
+  values : [h e l l o r u s t]
 ```
 
-## `arrow-buffer`: the memory substrate
+The entire Arrow system is built on these few shapes.
 
-`arrow-buffer` provides the storage types used by the rest of the stack:
+## `arrow-buffer` is the “legal memory” layer
 
-- `MutableBuffer`: growable, aligned, writable memory.
-- `Buffer`: immutable, shared, sliceable memory.
-- `BooleanBuffer`: packed bits.
-- `NullBuffer`: validity bitmap with Arrow null semantics.
-- `ScalarBuffer<T>`: typed fixed-width view over a `Buffer`.
-- `OffsetBuffer<O>`: validated monotonic offsets for variable-sized arrays.
+`arrow-buffer` defines the ways bytes may exist if they are to participate in Arrow:
 
-Think of this crate as "the legal ways to hold Arrow bytes."
+- `MutableBuffer`: growable writable memory
+- `Buffer`: immutable shared sliceable memory
+- `BooleanBuffer`: packed bits
+- `NullBuffer`: validity semantics on top of bits
+- `ScalarBuffer<T>`: typed fixed-width view
+- `OffsetBuffer<O>`: validated monotonic offsets
 
-## Cache-aware alignment is an explicit policy
+Think of this crate as defining the lawful storage substrate for everything above it.
 
-The code in `arrow-buffer/src/alloc/alignment.rs` is unusually revealing. It does not just say "align for correctness." It says alignment is chosen with spatial and temporal prefetcher behavior in mind.
+## Why alignment is an explicit throughput policy
 
-On `x86_64`, `ALIGNMENT` is `128` bytes. The comments cite Intel guidance and explain that the allocation policy is chosen to match cache and prefetch patterns, not merely ABI minimums.
+The comments in `arrow-buffer/src/alloc/alignment.rs` are unusually direct: the alignment choices are about spatial and temporal prefetcher behavior and cache-aware allocation, not just ABI correctness.
 
-That gives you the intended design philosophy:
+On `x86_64`, `ALIGNMENT` is `128` bytes.
 
-- alignment is a throughput decision,
-- layout is chosen for scan-heavy analytics,
-- the library is willing to over-align if that helps predictable access.
+That tells you a lot about the intended use case:
 
-## `MutableBuffer`: build aligned data first
+- Arrow expects scan-heavy workloads,
+- it is willing to over-align memory to help those scans,
+- the buffer layer is designed with CPU behavior in mind, not just type safety.
 
-`MutableBuffer` is the write-time workhorse. It rounds capacities up to multiples of 64 bytes via `round_upto_multiple_of_64`.
+This is one of the clearest examples of “policy baked into mechanics” in the repo.
 
-That means when builders append values, they are not just pushing bytes into a `Vec<u8>` with arbitrary growth. They are growing storage in a way that preserves the alignment story expected by later readers and compute kernels.
+## Why `MutableBuffer` rounds capacity up
+
+`MutableBuffer::with_capacity` rounds requested capacity up to a multiple of 64 bytes.
+
+That is not just an allocation convenience. It protects several later assumptions:
+
+- reallocation frequency stays lower,
+- alignment remains predictable,
+- buffers produced from builders have shapes compute code expects,
+- later conversion into immutable `Buffer` preserves the scan-friendly layout.
 
 ```text
-Requested capacity:  70 bytes
-Rounded capacity:   128 bytes
+requested: 70 bytes
+rounded:  128 bytes
 
-Why?
-  less frequent reallocations
-  predictable alignment
-  more cache-friendly scans later
+cost:
+  some extra space
+
+benefit:
+  better alignment story
+  fewer reallocations
+  more stable throughput
 ```
 
-## `Buffer`: immutable, shared, sliceable, zero-copy
+This is a typical Arrow tradeoff: pay a little extra memory to keep the hot path regular.
 
-`Buffer` is the read-time and sharing-time abstraction. Three details matter:
+## Why `Buffer` stores a pointer, not only an offset
 
-1. it is reference-counted,
-2. it can be sliced without copying,
-3. it stores a pointer directly, not just a base pointer plus offset.
+`Buffer` is immutable, shared, and sliceable. The especially important design detail is this comment in the implementation:
 
-That third detail is subtle and important. The code comments state that storing a pointer instead of only an offset avoids pointer arithmetic patterns that cause LLVM to miss vectorization opportunities. This is exactly the kind of low-level implementation decision the Arrow stack depends on: the data structure is shaped for compiler optimization, not just for API neatness.
+- it stores a pointer into the data, not merely a base pointer plus offset,
+- specifically to avoid pointer arithmetic patterns that hurt LLVM vectorization.
 
-## Validity is packed into bits, not bytes
+This is exactly the kind of low-level choice you would miss if you only looked at the API surface.
 
-Nullability is represented by `NullBuffer`, which wraps a `BooleanBuffer`. Each slot uses one bit:
+The design pressure is:
 
-```text
-Index:    0 1 2 3 4 5 6 7
-Valid?:   1 0 1 1 0 1 1 1
-Bitmap:   11101101  (bit order simplified for explanation)
-```
+- sliced arrays must be cheap,
+- but the representation of a slice should still generate good compiled code.
 
-Why pack bits?
+So the data structure itself is shaped for compiler behavior.
 
-- nullability is orthogonal metadata,
-- one bit per value is far cheaper than one byte or one enum tag,
-- validity scans can be fused with value scans.
+## Why nullability is a bitmap
 
-The important semantic rule is:
+`NullBuffer` wraps a packed bit buffer where:
 
-- `true` bit => valid value
-- `false` bit => null
+- `1` means valid,
+- `0` means null.
 
-This lets fixed-width arrays keep dense value buffers even when some logical positions are null.
+Why not store `Option<T>` values directly?
 
-## Offsets are Arrow's answer to variable-width values
+- it inflates fixed-width arrays,
+- it destroys dense value layout,
+- it adds per-value branching and tagging cost,
+- it makes interoperability harder because the null representation is no longer orthogonal.
 
-`OffsetBuffer<O>` stores monotonically increasing offsets. For `Utf8`, `Binary`, `List`, and related types, this is how Arrow turns a "sequence of variable-length things" into two contiguous buffers:
+The bitmap design says:
+
+- keep the values buffer dense,
+- keep nullability separate,
+- let kernels combine validity and value scans explicitly.
+
+That is why null positions may still contain arbitrary but well-formed bytes in the values buffer.
+
+## Why offsets solve variable-width data cleanly
+
+For `Utf8`, `Binary`, `List`, and related types, Arrow uses:
+
+- one offsets buffer,
+- one values buffer,
+- optional null bitmap.
+
+Example:
 
 ```text
 logical values = ["hello", "", "rust"]
@@ -117,37 +164,68 @@ slot 1 -> values[5..5]
 slot 2 -> values[5..9]
 ```
 
-The monotonic constraint is what keeps slicing and random access simple.
+This solves several problems at once:
 
-## Why Arrow prefers buffers over per-value objects
+- random access is simple,
+- slicing is simple,
+- empty values are represented naturally,
+- one contiguous values buffer is still possible.
 
-If strings were stored as `Vec<Option<String>>`, each logical value would drag in:
+The monotonicity of offsets is what keeps the representation sane and sliceable.
 
-- allocator overhead,
-- pointer indirection,
-- per-object metadata,
-- reduced cache locality.
+## Why Arrow can accept foreign memory
 
-Arrow instead stores:
+`Buffer` can be built from:
 
-- one bitmap,
-- one offsets buffer,
-- one values buffer.
+- `Vec<T>`
+- `bytes::Bytes`
+- custom allocations
+- mmap-backed memory
 
-That is the recurring Arrow pattern: move variability into side structures, keep the main storage contiguous.
+This is crucial for Arrow's interoperability story. If Arrow required all data to be freshly copied into a special owned container, zero-copy IPC and FFI would collapse into marketing language instead of a real property.
+
+So the low-level buffer layer is deliberately permissive about *where* memory comes from, as long as it can be represented with the required invariants.
+
+## The underlying theme
+
+All of these design choices are variations on one principle:
+
+```text
+make physical layout predictable enough that:
+  bytes can be interpreted cheaply,
+  slices can share storage,
+  kernels can vectorize,
+  foreign memory can participate
+```
+
+That is the reason this chapter belongs before `ArrayData` or `RecordBatch`.
+
+## Reimplementation checklist
+
+To build another Arrow implementation, you would need:
+
+1. aligned growable buffers,
+2. shared immutable sliceable buffers,
+3. packed bitmaps for booleans/nulls,
+4. validated monotonic offsets,
+5. a memory ownership model that can wrap foreign allocations.
+
+This is the true substrate of the system.
 
 ## Source markers
 
 - Alignment policy:
-  [`arrow-buffer/src/alloc/alignment.rs`](../../arrow-buffer/src/alloc/alignment.rs#L17),
-  [`arrow-buffer/src/alloc/alignment.rs`](../../arrow-buffer/src/alloc/alignment.rs#L38)
-- Rounding capacities to cache-friendly multiples:
-  [`arrow-buffer/src/util/bit_util.rs`](../../arrow-buffer/src/util/bit_util.rs#L24),
-  [`arrow-buffer/src/buffer/mutable.rs`](../../arrow-buffer/src/buffer/mutable.rs#L99),
-  [`arrow-buffer/src/buffer/mutable.rs`](../../arrow-buffer/src/buffer/mutable.rs#L128)
-- Shared immutable buffers and pointer choice:
+  [`arrow-buffer/src/alloc/alignment.rs`](../../arrow-buffer/src/alloc/alignment.rs#L17)
+- `MutableBuffer` guarantees and growth behavior:
+  [`arrow-buffer/src/buffer/mutable.rs`](../../arrow-buffer/src/buffer/mutable.rs#L31),
+  [`arrow-buffer/src/buffer/mutable.rs`](../../arrow-buffer/src/buffer/mutable.rs#L113),
+  [`arrow-buffer/src/buffer/mutable.rs`](../../arrow-buffer/src/buffer/mutable.rs#L246)
+- Rounding helper:
+  [`arrow-buffer/src/util/bit_util.rs`](../../arrow-buffer/src/util/bit_util.rs#L24)
+- `Buffer` and pointer-layout choice:
+  [`arrow-buffer/src/buffer/immutable.rs`](../../arrow-buffer/src/buffer/immutable.rs#L27),
   [`arrow-buffer/src/buffer/immutable.rs`](../../arrow-buffer/src/buffer/immutable.rs#L71)
-- Validity bitmap:
+- `NullBuffer`:
   [`arrow-buffer/src/buffer/null.rs`](../../arrow-buffer/src/buffer/null.rs#L34)
-- Variable-width offsets:
+- `OffsetBuffer`:
   [`arrow-buffer/src/buffer/offset.rs`](../../arrow-buffer/src/buffer/offset.rs#L59)

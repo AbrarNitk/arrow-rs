@@ -1,104 +1,147 @@
 # 9. Row Format, SIMD, And Execution-Oriented Patterns
 
-Arrow is fundamentally columnar, but real execution engines still need fast row-wise comparisons for:
+This chapter answers a seemingly paradoxical question:
 
-- lexicographic sort,
-- grouping,
-- hash and window preparation,
-- merge-like operators.
+**If Arrow is a columnar format, why does `arrow-rs` also implement a row-oriented format?**
 
-That is why `arrow-rs` has a separate `arrow-row` crate.
+Because “columnar is best” is only true for some classes of work.
 
-## Why a row format exists in a columnar system
+## Start with the execution problem
 
-Columnar memory is ideal for:
+Columnar layout is excellent for:
 
 - scanning one column,
 - vectorized arithmetic,
-- filter masks,
+- filtering with masks,
 - projection.
 
-But comparing multi-column tuples repeatedly can be awkward if every comparison has to hop across many arrays and type-specific comparison rules.
+But some operations care about *tuples* rather than individual columns:
 
-`arrow-row` solves this by converting columns into normalized row bytes that compare correctly with `memcmp`.
+- lexicographic sort,
+- grouping by multi-column keys,
+- merge comparisons,
+- window partition ordering.
 
-## The conversion idea
+If every tuple comparison must:
 
-```text
-Input columns
-  col0: UInt64
-  col1: Utf8
-  col2: Float64
+- jump across several arrays,
+- branch on several types,
+- apply several comparison rules,
 
-        │
-        ▼
-RowConverter
+then the columnar representation is no longer the easiest execution shape for that operator.
 
-        ▼
-row0 -> [normalized bytes...]
-row1 -> [normalized bytes...]
-row2 -> [normalized bytes...]
-```
+So the question becomes:
 
-After conversion, row comparison can often be reduced to byte comparison.
+**Can we derive a row-oriented byte format from Arrow columns such that bytewise order matches logical tuple order?**
 
-## Why this is fast
+`arrow-row` is the answer.
 
-The row docs explain that rows are normalized for sorting. That means the encoding is chosen so that binary order matches logical Arrow order.
+## Why `memcmp` is the goal
 
-This unlocks:
+The row format is designed so that comparing rows can often reduce to `memcmp`.
 
-- `memcmp`-based comparison,
-- radix-sort-friendly behavior,
-- more predictable branching than repeated per-column dynamic dispatch.
+That is powerful because it turns:
 
-So Arrow stays columnar for storage and scan-heavy compute, but introduces a row-oriented derivative format when comparison-heavy algorithms benefit from it.
+- many type-specific comparisons,
 
-## Encoding strategy
+into:
 
-The crate docs explain the normalization rules for:
+- one normalized byte comparison.
 
-- unsigned integers,
-- signed integers,
-- floats,
-- fixed-length bytes,
-- variable-length bytes.
+This supports:
 
-For signed integers, for example, the sign bit is flipped before encoding so that lexicographic byte order matches numeric order.
+- efficient multi-column sorting,
+- radix-sort-style strategies,
+- lower branch overhead,
+- better cache locality during comparison-heavy phases.
 
-That is the important pattern: encode values into a sortable byte domain.
+## What “normalized for sorting” really means
 
-## Dictionary flattening is a deliberate tradeoff
+The row encoding is not arbitrary serialization. It is carefully chosen so that lexicographic byte order matches Arrow logical order.
 
-The docs note that dictionary arrays are flattened to underlying values during row conversion. That may lose the original dictionary type on the way back out, but it avoids carrying type-specific dictionary comparison complexity in the row format.
+That means different types need different normalization tricks:
 
-This is a classic execution tradeoff:
+- unsigned integers can use big-endian style ordering,
+- signed integers need sign-bit manipulation,
+- floats need IEEE-aware transformation,
+- variable-length bytes need sentinel-safe ordering rules.
 
-- preserve exact original representation, or
-- normalize aggressively for algorithmic speed.
+This is why the row-format docs spend so much time on encoding rules: correctness depends on order preservation, not just reversibility.
 
-`arrow-row` chooses the second.
+## Why the row format is derivative, not primary
 
-## Where SIMD fits in the story
+Arrow storage remains columnar because that is still the best general-purpose physical format for many workloads.
 
-The repo does not centralize "SIMD" into one magic module because Arrow's performance story is broader:
+The row format is a derived execution format:
 
-- aligned contiguous buffers help vector loads,
-- bit-packed null buffers help dense validity handling,
-- pointer layout choices help LLVM vectorization,
-- batch-oriented execution amortizes overhead.
+- built from columns,
+- used for comparison-heavy phases,
+- sometimes converted back again.
 
-The top-level Arrow README also calls out `target-cpu=native` and AVX512-related performance guidance. That is another clue that the implementation is designed to let the compiler and CPU exploit the physical layout aggressively.
+This is the right architecture because it avoids sacrificing the strong properties of columnar storage just to optimize a narrower class of algorithms.
+
+## Why dictionary flattening is a deliberate tradeoff
+
+`arrow-row` flattens dictionary arrays to underlying values during conversion.
+
+Why accept that?
+
+- keeping dictionary identity in the row format would complicate normalized comparison,
+- the row format cares about comparison semantics more than representation preservation,
+- the conversion is meant for execution, not for round-tripping exact physical identity.
+
+This is a very clear policy decision:
+
+- optimize for comparison behavior,
+- not for preserving every original container choice.
+
+## Where SIMD fits into the broader story
+
+Arrow performance is not “there is one SIMD module somewhere.”
+
+It is the compound result of:
+
+- aligned dense buffers,
+- packed bitmaps,
+- sliceable shared memory,
+- compiler-friendly pointer layout,
+- batch-oriented operators,
+- and, when needed, derived row encodings that improve comparison patterns.
+
+That is why the top-level README talks about `target-cpu=native` and AVX512-related guidance. The repository is structured so the compiler and CPU have a good chance to do the right thing.
+
+## Why the row format may change across releases
+
+The docs explicitly note that the row encoding may change between releases.
+
+That is a useful boundary to understand:
+
+- Arrow's main memory format is the stable interoperability contract,
+- the row format is an internal execution-oriented derivative representation.
+
+So it is free to evolve more aggressively as long as it still serves its execution purpose.
+
+## Reimplementation checklist
+
+To rebuild Arrow-style execution support deeply, you need:
+
+1. a columnar primary format,
+2. a derived row encoding whose byte order matches logical order,
+3. normalization rules per type family,
+4. explicit tradeoffs such as dictionary flattening,
+5. an understanding that execution formats can evolve faster than the core memory contract.
 
 ## Source markers
 
-- Comparable row format overview and normalization docs:
+- Row-format overview and `memcmp` motivation:
   [`arrow-row/src/lib.rs`](../../arrow-row/src/lib.rs#L1)
 - `RowConverter`:
   [`arrow-row/src/lib.rs`](../../arrow-row/src/lib.rs#L532)
-- Pointer-layout choice that helps vectorization:
+- Normalization rules:
+  [`arrow-row/src/lib.rs`](../../arrow-row/src/lib.rs#L188)
+- Dictionary flattening docs:
+  [`arrow-row/src/lib.rs`](../../arrow-row/src/lib.rs#L120)
+- Pointer layout helping vectorization:
   [`arrow-buffer/src/buffer/immutable.rs`](../../arrow-buffer/src/buffer/immutable.rs#L71)
-- Cache-aware alignment policy:
-  [`arrow-buffer/src/alloc/alignment.rs`](../../arrow-buffer/src/alloc/alignment.rs#L17)
-- Top-level performance guidance:
+- Performance guidance:
   [`arrow/README.md`](../../arrow/README.md)
